@@ -5,11 +5,18 @@ import time
 import hashlib
 import asyncio
 from typing import Any, Optional
+from datetime import datetime
 
 import httpx
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
+
+try:
+    # Python 3.9+
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover
+    ZoneInfo = None  # type: ignore
 
 
 # -----------------------------
@@ -50,7 +57,7 @@ class ForecastResponse(BaseModel):
     notes: list[str]
 
 
-app = FastAPI(title="SurfCast API", version="0.4.0")
+app = FastAPI(title="SurfCast API", version="0.5.0")
 
 
 SPOTS_CSV_PATH = os.getenv("SPOTS_CSV_PATH", "./surf_registry_us_v4_with_latlon.csv")
@@ -103,9 +110,42 @@ def surf_estimate_ft(swell_m, period_s, wind_wave_m):
 
     energy = float(swell_m) * (max(float(period_s), 1.0) ** 0.5)
     chop = float(wind_wave_m or 0.0)
-
     face_ft = 3.5 * energy - 2.0 * chop
     return max(face_ft, 0.0)
+
+
+def find_start_index(times: list[str], timezone: str) -> int:
+    """
+    Given Open-Meteo hourly time strings like 'YYYY-MM-DDTHH:MM' in the requested timezone,
+    find the first index whose time is >= current local hour.
+    """
+    if ZoneInfo is None:
+        # Fallback: just start at 0 if zoneinfo isn't available
+        return 0
+
+    tz = ZoneInfo(timezone)
+    now = datetime.now(tz)
+    now_floor = now.replace(minute=0, second=0, microsecond=0)
+
+    # Fast path: match exact current-hour string
+    now_key = now_floor.strftime("%Y-%m-%dT%H:%M")
+    try:
+        return times.index(now_key)
+    except ValueError:
+        pass
+
+    # Otherwise find first time >= now_floor
+    for i, t in enumerate(times):
+        # times are local time strings without offset; interpret in tz
+        try:
+            dt = datetime.fromisoformat(t).replace(tzinfo=tz)
+        except ValueError:
+            # If any weird formatting slips in, skip it
+            continue
+        if dt >= now_floor:
+            return i
+
+    return 0
 
 
 @app.get("/v1/forecast", response_model=ForecastResponse)
@@ -123,6 +163,7 @@ async def forecast(
     lat = float(spot["lat"])
     lon = float(spot["lon"])
 
+    # Cache per hour bucket (still fine)
     hour_bucket = str(int(time.time() // 3600))
     cache_key = stable_key("forecast", spot_id, str(hours), timezone, hour_bucket)
 
@@ -149,17 +190,26 @@ async def forecast(
         )
         marine_json = marine_resp.json()
 
-    times = marine_json["hourly"]["time"][:hours]
-    total_wave = marine_json["hourly"]["wave_height"][:hours]
-    swell = marine_json["hourly"]["swell_wave_height"][:hours]
-    period = marine_json["hourly"]["swell_wave_period"][:hours]
-    wind_wave = marine_json["hourly"]["wind_wave_height"][:hours]
+    all_times: list[str] = (marine_json.get("hourly", {}).get("time") or [])
+    if not all_times:
+        raise HTTPException(502, "Upstream returned no hourly time series.")
+
+    start_index = find_start_index(all_times, timezone)
+    end_index = start_index + hours
+
+    times = all_times[start_index:end_index]
+    total_wave = (marine_json["hourly"].get("wave_height") or [])[start_index:end_index]
+    swell = (marine_json["hourly"].get("swell_wave_height") or [])[start_index:end_index]
+    period = (marine_json["hourly"].get("swell_wave_period") or [])[start_index:end_index]
+    wind_wave = (marine_json["hourly"].get("wind_wave_height") or [])[start_index:end_index]
+
+    n = min(len(times), len(total_wave), len(swell), len(period), len(wind_wave))
+    if n == 0:
+        raise HTTPException(502, "Upstream returned insufficient hourly data.")
 
     hourly_data = []
-
-    for i in range(len(times)):
+    for i in range(n):
         est = surf_estimate_ft(swell[i], period[i], wind_wave[i])
-
         hourly_data.append({
             "time": times[i],
             "total_wave_m": total_wave[i],
@@ -168,9 +218,9 @@ async def forecast(
             "surf_est_ft": est,
         })
 
+    # Rank best 3-hour windows by estimated surf face height
     best_windows = []
     scores = []
-
     for i in range(len(hourly_data) - 2):
         block = hourly_data[i:i+3]
         vals = [h["surf_est_ft"] for h in block if h["surf_est_ft"] is not None]
@@ -179,7 +229,6 @@ async def forecast(
         scores.append((sum(vals) / len(vals), i))
 
     scores.sort(reverse=True)
-
     for avg, i in scores[:3]:
         block = hourly_data[i:i+3]
         best_windows.append({
@@ -207,6 +256,7 @@ async def forecast(
         "hourly": hourly_data,
         "notes": [
             "Wind temporarily removed for stability (marine-only model).",
+            "Forecast window starts at the current local hour (not midnight).",
             "Using stored lat/lon from registry.",
             "Hourly data cached per spot per hour.",
             "Surf estimate is spot-agnostic."
