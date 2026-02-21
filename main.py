@@ -3,12 +3,14 @@ from __future__ import annotations
 import os
 import time
 import hashlib
-from typing import Any, Optional, Tuple
+import asyncio
+from typing import Any, Optional
 
 import httpx
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
+
 
 # -----------------------------
 # Simple in-memory TTL cache
@@ -35,8 +37,16 @@ def stable_key(*parts: str) -> str:
         h.update(b"|")
     return h.hexdigest()
 
+
 # -----------------------------
-# Models
+# Open-Meteo endpoints
+# -----------------------------
+OPEN_METEO_MARINE = "https://marine-api.open-meteo.com/v1/marine"
+OPEN_METEO_WEATHER = "https://api.open-meteo.com/v1/forecast"
+
+
+# -----------------------------
+# FastAPI app
 # -----------------------------
 class ForecastResponse(BaseModel):
     spot: dict
@@ -46,67 +56,85 @@ class ForecastResponse(BaseModel):
     hourly: list
     notes: list[str]
 
-# -----------------------------
-# Config
-# -----------------------------
-SPOTS_CSV_PATH = os.getenv("SPOTS_CSV_PATH", "./surf_registry_us_v4_with_latlon.csv")
+app = FastAPI(title="SurfCast API", version="0.3.0")
 
-OPEN_METEO_GEO = "https://geocoding-api.open-meteo.com/v1/search"
-OPEN_METEO_MARINE = "https://marine-api.open-meteo.com/v1/marine"
-OPEN_METEO_WEATHER = "https://api.open-meteo.com/v1/forecast"
-
-app = FastAPI(title="SurfCast API", version="0.2.0")
 
 # -----------------------------
 # Load Spot Registry
 # -----------------------------
+SPOTS_CSV_PATH = os.getenv("SPOTS_CSV_PATH", "./surf_registry_us_v4_with_latlon.csv")
 spots_df = pd.read_csv(SPOTS_CSV_PATH)
+
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "spots_loaded": len(spots_df)}
+    return {"status": "ok", "spots_loaded": int(len(spots_df))}
+
 
 @app.get("/v1/spots/search")
 def search_spots(q: str = Query(..., min_length=2), limit: int = 20):
-    matches = spots_df[spots_df["spot_name"].str.contains(q, case=False, na=False)].head(limit)
+    matches = spots_df[
+        spots_df["spot_name"].str.contains(q, case=False, na=False)
+    ].head(limit)
+
     return matches[["spot_id", "spot_name", "state", "region"]].to_dict(orient="records")
 
-async def geocode(query: str, country_code: str = "US") -> Tuple[float, float]:
-    key = stable_key("geo", query, country_code)
-    cached = cache_get(key)
-    if cached:
-        return cached
 
-    async with httpx.AsyncClient(timeout=20) as client:
-        resp = await client.get(
-            OPEN_METEO_GEO,
-            params={"name": query, "count": 1, "format": "json", "countryCode": country_code},
-        )
-        resp.raise_for_status()
-        data = resp.json()
+# -----------------------------
+# HTTP helper with retry/backoff
+# -----------------------------
+async def get_with_backoff(
+    client: httpx.AsyncClient,
+    url: str,
+    params: dict,
+    retries: int = 4,
+    base_delay_s: float = 1.0,
+):
+    """
+    Retries on 429 with exponential backoff.
+    """
+    delay = base_delay_s
+    last_status = None
 
-    results = data.get("results") or []
-    if not results:
-        raise HTTPException(404, f"Could not geocode: {query}")
+    for attempt in range(retries + 1):
+        resp = await client.get(url, params=params)
+        last_status = resp.status_code
 
-    lat = float(results[0]["latitude"])
-    lon = float(results[0]["longitude"])
+        if resp.status_code != 429:
+            resp.raise_for_status()
+            return resp
 
-    cache_set(key, (lat, lon), ttl_seconds=30 * 24 * 3600)
-    return lat, lon
+        # 429: Too Many Requests
+        if attempt == retries:
+            # include a helpful message
+            raise HTTPException(
+                status_code=429,
+                detail=f"Upstream rate limited (429) from Open-Meteo after {retries+1} attempts: {url}"
+            )
 
+        await asyncio.sleep(delay)
+        delay *= 2
+
+    raise HTTPException(status_code=502, detail=f"Unexpected upstream error (status={last_status}).")
+
+
+# -----------------------------
+# Surf estimate heuristic
+# -----------------------------
 def surf_estimate_ft(swell_m, period_s, wind_wave_m, wind_mps):
     if swell_m is None or period_s is None:
         return None
 
-    energy = swell_m * (max(period_s, 1) ** 0.5)
-    chop = wind_wave_m or 0
+    energy = float(swell_m) * (max(float(period_s), 1.0) ** 0.5)
+    chop = float(wind_wave_m or 0.0)
     face_ft = 3.5 * energy - 2.0 * chop
 
-    if wind_mps and wind_mps > 8:
+    # penalize very windy conditions even without direction
+    if wind_mps is not None and float(wind_mps) > 8.0:  # ~18mph
         face_ft *= 0.8
 
-    return max(face_ft, 0)
+    return max(face_ft, 0.0)
+
 
 @app.get("/v1/forecast", response_model=ForecastResponse)
 async def forecast(
@@ -120,65 +148,83 @@ async def forecast(
 
     spot = row.iloc[0]
 
-    # Prefer stored lat/lon (best)
+    # Prefer stored lat/lon
     lat = spot.get("lat")
     lon = spot.get("lon")
+    if pd.isna(lat) or pd.isna(lon):
+        raise HTTPException(
+            status_code=400,
+            detail="Spot is missing lat/lon in the registry. Please enrich the CSV with coordinates."
+        )
 
-    if pd.notna(lat) and pd.notna(lon):
-        lat, lon = float(lat), float(lon)
-        notes_extra = "Using stored lat/lon from registry."
-    else:
-        # Fallback: geocode (should be rare once registry is enriched)
-        lat, lon = await geocode(str(spot["geocode_query"]))
-        notes_extra = "Lat/lon not in registry; geocoded at runtime."
+    lat = float(lat)
+    lon = float(lon)
 
-    # Cache per-hour bucket to avoid pounding upstream
-    cache_key = stable_key("forecast", spot_id, str(hours), timezone, str(int(time.time() // 3600)))
+    # Hour-bucket cache: one upstream fetch per spot per hour (per hours/timezone settings)
+    hour_bucket = str(int(time.time() // 3600))
+    cache_key = stable_key("forecast", spot_id, str(hours), timezone, hour_bucket)
+
     cached = cache_get(cache_key)
     if cached:
         return cached
 
-    hourly_vars = ",".join([
+    hourly_marine = ",".join([
         "wave_height,wave_period,wave_direction",
         "swell_wave_height,swell_wave_period,swell_wave_direction",
         "wind_wave_height",
     ])
 
-    async with httpx.AsyncClient(timeout=25) as client:
-        marine = await client.get(
+    async with httpx.AsyncClient(timeout=30) as client:
+        marine_resp = await get_with_backoff(
+            client,
             OPEN_METEO_MARINE,
-            params={"latitude": lat, "longitude": lon, "hourly": hourly_vars, "timezone": timezone},
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "hourly": hourly_marine,
+                "timezone": timezone,
+            },
         )
-        marine.raise_for_status()
-        marine_json = marine.json()
+        marine_json = marine_resp.json()
 
-        weather = await client.get(
+        weather_resp = await get_with_backoff(
+            client,
             OPEN_METEO_WEATHER,
-            params={"latitude": lat, "longitude": lon, "hourly": "wind_speed_10m", "timezone": timezone},
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "hourly": "wind_speed_10m",
+                "timezone": timezone,
+            },
         )
-        weather.raise_for_status()
-        weather_json = weather.json()
+        weather_json = weather_resp.json()
 
-    times = marine_json["hourly"]["time"][:hours]
+    times = (marine_json.get("hourly", {}).get("time") or [])[:hours]
+    if not times:
+        raise HTTPException(502, "Upstream returned no hourly time series.")
+
+    # Pull arrays (safely)
+    H_total = (marine_json["hourly"].get("wave_height") or [])[:hours]
+    H_swell = (marine_json["hourly"].get("swell_wave_height") or [])[:hours]
+    T_swell = (marine_json["hourly"].get("swell_wave_period") or [])[:hours]
+    H_windwave = (marine_json["hourly"].get("wind_wave_height") or [])[:hours]
+    wind = (weather_json.get("hourly", {}).get("wind_speed_10m") or [])[:hours]
 
     hourly_data = []
-    for i, t in enumerate(times):
-        swell = marine_json["hourly"]["swell_wave_height"][i]
-        period = marine_json["hourly"]["swell_wave_period"][i]
-        wind_wave = marine_json["hourly"]["wind_wave_height"][i]
-        wind = weather_json["hourly"]["wind_speed_10m"][i]
+    n = min(len(times), len(H_total), len(H_swell), len(T_swell), len(H_windwave), len(wind))
 
-        est = surf_estimate_ft(swell, period, wind_wave, wind)
-
+    for i in range(n):
+        est = surf_estimate_ft(H_swell[i], T_swell[i], H_windwave[i], wind[i])
         hourly_data.append({
-            "time": t,
-            "swell_m": swell,
-            "period_s": period,
-            "wind_mps": wind,
-            "surf_est_ft": est
+            "time": times[i],
+            "total_wave_m": H_total[i],
+            "swell_m": H_swell[i],
+            "period_s": T_swell[i],
+            "wind_mps": wind[i],
+            "surf_est_ft": est,
         })
 
-    # Rank best 3-hour windows
+    # Rank best 3-hour windows by estimated surf face height
     best_windows = []
     scores = []
     for i in range(len(hourly_data) - 2):
@@ -186,8 +232,7 @@ async def forecast(
         vals = [h["surf_est_ft"] for h in block if h["surf_est_ft"] is not None]
         if len(vals) < 2:
             continue
-        avg = sum(vals) / len(vals)
-        scores.append((avg, i))
+        scores.append((sum(vals) / len(vals), i))
 
     scores.sort(reverse=True)
     for avg, i in scores[:3]:
@@ -196,10 +241,10 @@ async def forecast(
             "start": block[0]["time"],
             "end": block[-1]["time"],
             "surf_est_ft_range": [
-                round(min(h["surf_est_ft"] for h in block), 1),
-                round(max(h["surf_est_ft"] for h in block), 1),
+                round(min(h["surf_est_ft"] for h in block if h["surf_est_ft"] is not None), 1),
+                round(max(h["surf_est_ft"] for h in block if h["surf_est_ft"] is not None), 1),
             ],
-            "summary": "Top 3-hour surf window"
+            "summary": "Top 3-hour surf window (spot-agnostic estimate).",
         })
 
     response = {
@@ -209,18 +254,19 @@ async def forecast(
             "state": spot["state"],
             "region": spot["region"],
             "lat": lat,
-            "lon": lon
+            "lon": lon,
         },
         "window_hours": hours,
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "best_windows": best_windows,
         "hourly": hourly_data,
         "notes": [
-            notes_extra,
-            "Surf estimate is spot-agnostic; reefs/points/bathymetry can amplify or shadow swell.",
-            "Wind direction vs beach orientation not yet modeled."
-        ]
+            "Using stored lat/lon from registry; no runtime geocoding.",
+            "Hourly data is cached per-spot per-hour to reduce upstream load.",
+            "Surf estimate is spot-agnostic; local bathymetry/sandbars can change outcomes.",
+        ],
     }
 
-    cache_set(cache_key, response, ttl_seconds=1800)
+    # cache for 55 minutes so it survives most of the hour bucket
+    cache_set(cache_key, response, ttl_seconds=55 * 60)
     return response
