@@ -5,7 +5,7 @@ import time
 import hashlib
 import asyncio
 from typing import Any, Optional
-from datetime import datetime
+from datetime import datetime, date
 
 import httpx
 import pandas as pd
@@ -17,6 +17,9 @@ try:
     from zoneinfo import ZoneInfo
 except ImportError:  # pragma: no cover
     ZoneInfo = None  # type: ignore
+
+from astral import Observer
+from astral.sun import sun
 
 
 # -----------------------------
@@ -57,7 +60,7 @@ class ForecastResponse(BaseModel):
     notes: list[str]
 
 
-app = FastAPI(title="SurfCast API", version="0.5.0")
+app = FastAPI(title="SurfCast API", version="0.6.0")
 
 
 SPOTS_CSV_PATH = os.getenv("SPOTS_CSV_PATH", "./surf_registry_us_v4_with_latlon.csv")
@@ -116,36 +119,45 @@ def surf_estimate_ft(swell_m, period_s, wind_wave_m):
 
 def find_start_index(times: list[str], timezone: str) -> int:
     """
-    Given Open-Meteo hourly time strings like 'YYYY-MM-DDTHH:MM' in the requested timezone,
-    find the first index whose time is >= current local hour.
+    Open-Meteo times are local strings like 'YYYY-MM-DDTHH:MM' in the requested timezone.
+    Start at the first timestamp >= the current local hour.
     """
     if ZoneInfo is None:
-        # Fallback: just start at 0 if zoneinfo isn't available
         return 0
 
     tz = ZoneInfo(timezone)
     now = datetime.now(tz)
     now_floor = now.replace(minute=0, second=0, microsecond=0)
 
-    # Fast path: match exact current-hour string
     now_key = now_floor.strftime("%Y-%m-%dT%H:%M")
     try:
         return times.index(now_key)
     except ValueError:
         pass
 
-    # Otherwise find first time >= now_floor
     for i, t in enumerate(times):
-        # times are local time strings without offset; interpret in tz
         try:
             dt = datetime.fromisoformat(t).replace(tzinfo=tz)
         except ValueError:
-            # If any weird formatting slips in, skip it
             continue
         if dt >= now_floor:
             return i
 
     return 0
+
+
+def daylight_bounds_for_date(d: date, lat: float, lon: float, tz) -> tuple[datetime, datetime]:
+    """
+    Returns (sunrise, sunset) for the date at lat/lon in tz.
+    """
+    obs = Observer(latitude=lat, longitude=lon)
+    s = sun(obs, date=d, tzinfo=tz)
+    return s["sunrise"], s["sunset"]
+
+
+def is_daylight(dt_local: datetime, lat: float, lon: float, tz) -> bool:
+    sunrise, sunset = daylight_bounds_for_date(dt_local.date(), lat, lon, tz)
+    return sunrise <= dt_local <= sunset
 
 
 @app.get("/v1/forecast", response_model=ForecastResponse)
@@ -159,11 +171,10 @@ async def forecast(
         raise HTTPException(404, "Spot not found")
 
     spot = row.iloc[0]
-
     lat = float(spot["lat"])
     lon = float(spot["lon"])
 
-    # Cache per hour bucket (still fine)
+    # Cache per hour bucket (keeps upstream calls low)
     hour_bucket = str(int(time.time() // 3600))
     cache_key = stable_key("forecast", spot_id, str(hours), timezone, hour_bucket)
 
@@ -218,19 +229,50 @@ async def forecast(
             "surf_est_ft": est,
         })
 
-    # Rank best 3-hour windows by estimated surf face height
+    # ---- Daylight-only ranking for best windows ----
     best_windows = []
     scores = []
+
+    if ZoneInfo is None:
+        # If zoneinfo isn't available, fall back to ranking everything
+        tz = None
+    else:
+        tz = ZoneInfo(timezone)
+
     for i in range(len(hourly_data) - 2):
         block = hourly_data[i:i+3]
+
+        # Require all 3 hours to be between sunrise and sunset
+        if tz is not None:
+            ok = True
+            for h in block:
+                dt_local = datetime.fromisoformat(h["time"]).replace(tzinfo=tz)
+                if not is_daylight(dt_local, lat, lon, tz):
+                    ok = False
+                    break
+            if not ok:
+                continue
+
         vals = [h["surf_est_ft"] for h in block if h["surf_est_ft"] is not None]
         if len(vals) < 2:
             continue
         scores.append((sum(vals) / len(vals), i))
 
     scores.sort(reverse=True)
-    for avg, i in scores[:3]:
-        block = hourly_data[i:i+3]
+
+    chosen_ranges = []  # list of (start_idx, end_idx) inclusive indices in hourly_data
+    best_windows = []
+
+    for avg, i in scores:
+        start_idx = i
+        end_idx = i + 2  # 3 hours block
+
+        # reject overlap with any already chosen block
+        overlaps = any(not (end_idx < s or start_idx > e) for (s, e) in chosen_ranges)
+        if overlaps:
+            continue
+
+        block = hourly_data[start_idx:end_idx + 1]
         best_windows.append({
             "start": block[0]["time"],
             "end": block[-1]["time"],
@@ -238,8 +280,12 @@ async def forecast(
                 round(min(h["surf_est_ft"] for h in block), 1),
                 round(max(h["surf_est_ft"] for h in block), 1),
             ],
-            "summary": "Top 3-hour surf window (spot-agnostic estimate).",
+            "summary": "Top 3-hour surf window (daylight only; non-overlapping).",
         })
+        chosen_ranges.append((start_idx, end_idx))
+
+        if len(best_windows) >= 3:
+            break
 
     response = {
         "spot": {
@@ -257,9 +303,9 @@ async def forecast(
         "notes": [
             "Wind temporarily removed for stability (marine-only model).",
             "Forecast window starts at the current local hour (not midnight).",
+            "Best windows are restricted to daylight (sunrise→sunset).",
             "Using stored lat/lon from registry.",
             "Hourly data cached per spot per hour.",
-            "Surf estimate is spot-agnostic."
         ],
     }
 
