@@ -301,13 +301,19 @@ def render_forecast_image(
     dpi: int,
     fmt: Literal["png", "jpg"],
 ) -> bytes:
+    def _parse_local_time(s: str, tz) -> datetime:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=tz)
+        return dt.astimezone(tz)
+
     # Parse series
     x: list[datetime] = []
     y: list[float] = []
 
     for h in hourly:
         try:
-            dt = datetime.fromisoformat(h["time"]).replace(tzinfo=tz)
+            dt = _parse_local_time(h["time"], tz)
         except Exception:
             continue
         x.append(dt)
@@ -325,7 +331,7 @@ def render_forecast_image(
     tmin = x[0]
     tmax = x[-1] + timedelta(hours=1)
 
-    # Precompute daylight bounds per day (cached by your daylight_bounds_for_date)
+    # Precompute daylight bounds per day
     dates = sorted({dt.date() for dt in x})
     day_bounds = {d: daylight_bounds_for_date(d, lat, lon, tz) for d in dates}
 
@@ -333,9 +339,8 @@ def render_forecast_image(
     best_spans: list[tuple[datetime, datetime]] = []
     for bw in best_windows:
         try:
-            s = datetime.fromisoformat(bw["start"]).replace(tzinfo=tz)
-            e = datetime.fromisoformat(bw["end"]).replace(tzinfo=tz) + timedelta(hours=1)
-            # clamp to plot range
+            s = _parse_local_time(bw["start"], tz)
+            e = _parse_local_time(bw["end"], tz) + timedelta(hours=1)
             s = max(s, tmin)
             e = min(e, tmax)
             if s < e:
@@ -346,9 +351,8 @@ def render_forecast_image(
     fig = plt.figure(figsize=(width / dpi, height / dpi), dpi=dpi)
     ax = fig.add_subplot(111)
 
-    # 1) Shade dusk->dawn in grey (outside sunrise->sunset), per day segment
-    # Use explicit facecolor so it is never “random”
-    night_color = "0.85"  # light grey
+    # Shade dusk->dawn in grey
+    night_color = "0.85"
     night_alpha = 0.6
 
     for d in dates:
@@ -361,40 +365,37 @@ def render_forecast_image(
         if seg_start >= seg_end:
             continue
 
-        # pre-dawn segment
         if seg_start < sunrise:
             ax.axvspan(
                 seg_start, min(sunrise, seg_end),
                 facecolor=night_color, alpha=night_alpha, zorder=0
             )
-        # post-dusk segment
         if sunset < seg_end:
             ax.axvspan(
                 max(sunset, seg_start), seg_end,
                 facecolor=night_color, alpha=night_alpha, zorder=0
             )
 
-    # 2) Highlight best windows in green (on top of night shading)
-    best_color = "green"
-    best_alpha = 0.22
+    # Highlight best windows in green
     for s, e in best_spans:
-        ax.axvspan(s, e, facecolor=best_color, alpha=best_alpha, zorder=1)
+        ax.axvspan(s, e, facecolor="green", alpha=0.22, zorder=1)
 
-    # 3) Plot series last so it sits on top
+    # Plot series last
     ax.plot(x, y, zorder=2)
 
     ax.set_title(f"{spot_name} — Total Wave (m)")
     ax.set_ylabel("total_wave_m")
     ax.set_xlabel("Local time")
 
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%-I%p"))
-    ax.xaxis.set_major_locator(mdates.HourLocator(interval=3))
+    # ✅ Force matplotlib to format ticks in the same tz
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%-I%p", tz=tz))
+    ax.xaxis.set_major_locator(mdates.HourLocator(interval=3, tz=tz))
+
     fig.autofmt_xdate()
     fig.tight_layout()
 
     buf = io.BytesIO()
     if fmt == "jpg":
-        # Safer JPEG save across environments
         fig.savefig(buf, format="jpeg", dpi=dpi, pil_kwargs={"quality": 85, "optimize": True})
     else:
         fig.savefig(buf, format="png", dpi=dpi)
@@ -410,7 +411,7 @@ def render_forecast_image(
 async def forecast(
     spot_id: str,
     hours: int = Query(72, ge=6, le=168),
-    timezone: str = "America/Los_Angeles",
+    timezone: str = "auto",  # ✅ let Open-Meteo choose the correct spot timezone by default
 ):
     spot = spots_by_id.get(spot_id)
     if not spot:
@@ -418,12 +419,6 @@ async def forecast(
 
     lat = float(spot["lat"])
     lon = float(spot["lon"])
-
-    hour_bucket = str(int(time.time() // 3600))
-    cache_key = stable_key("forecast", spot_id, str(hours), timezone, hour_bucket)
-    cached = _cache_get(_FORECAST_CACHE, cache_key)
-    if cached:
-        return cached
 
     hourly_vars = ",".join(
         [
@@ -433,6 +428,13 @@ async def forecast(
         ]
     )
 
+    # Cache per hour bucket, but DO NOT finalize cache key until we know timezone_used
+    hour_bucket = str(int(time.time() // 3600))
+    provisional_key = stable_key("forecast", spot_id, str(hours), timezone, hour_bucket)
+    cached = _cache_get(_FORECAST_CACHE, provisional_key)
+    if cached:
+        return cached
+
     async with httpx.AsyncClient(timeout=30) as client:
         marine_resp = await get_with_backoff(
             client,
@@ -441,16 +443,28 @@ async def forecast(
                 "latitude": lat,
                 "longitude": lon,
                 "hourly": hourly_vars,
-                "timezone": timezone,
+                "timezone": timezone,  # "auto" or explicit tz
             },
         )
         marine_json = marine_resp.json()
+
+    # ✅ Use the timezone returned by Open-Meteo (authoritative when timezone="auto")
+    timezone_used = marine_json.get("timezone") or timezone
+    if timezone_used == "auto":
+        # Safety: if upstream didn't return timezone for some reason
+        timezone_used = "UTC"
+
+    # Now that we know timezone_used, we can use a stable cache key
+    cache_key = stable_key("forecast", spot_id, str(hours), timezone_used, hour_bucket)
+    cached2 = _cache_get(_FORECAST_CACHE, cache_key)
+    if cached2:
+        return cached2
 
     all_times: list[str] = (marine_json.get("hourly", {}).get("time") or [])
     if not all_times:
         raise HTTPException(502, "Upstream returned no hourly time series.")
 
-    start_index = find_start_index(all_times, timezone)
+    start_index = find_start_index(all_times, timezone_used)
     end_index = start_index + hours
 
     times = all_times[start_index:end_index]
@@ -468,7 +482,7 @@ async def forecast(
         est = surf_estimate_ft(swell[i], period[i], wind_wave[i])
         hourly_data.append(
             {
-                "time": times[i],
+                "time": times[i],  # NOTE: this is in timezone_used as requested/returned by Open-Meteo
                 "total_wave_m": total_wave[i],
                 "swell_m": swell[i],
                 "period_s": period[i],
@@ -480,7 +494,19 @@ async def forecast(
     # ---- Daylight-only ranking for best windows (non-overlapping 3-hour blocks) ----
     best_windows: list[dict[str, Any]] = []
     scores: list[tuple[float, int]] = []
-    tz = ZoneInfo(timezone) if ZoneInfo is not None else None
+
+    if ZoneInfo is None:
+        tz = None
+    else:
+        tz = ZoneInfo(timezone_used)
+
+    def _parse_local_time(s: str, tz: ZoneInfo) -> datetime:
+        dt = datetime.fromisoformat(s)
+        # if string is naive (most common for Open-Meteo), assume it's already local in tz
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=tz)
+        # if it ever includes offset, convert properly
+        return dt.astimezone(tz)
 
     for i in range(len(hourly_data) - 2):
         block = hourly_data[i : i + 3]
@@ -489,7 +515,7 @@ async def forecast(
             ok = True
             for h in block:
                 try:
-                    dt_local = datetime.fromisoformat(h["time"]).replace(tzinfo=tz)
+                    dt_local = _parse_local_time(h["time"], tz)
                 except ValueError:
                     ok = False
                     break
@@ -539,6 +565,7 @@ async def forecast(
             "region": spot["region"],
             "lat": lat,
             "lon": lon,
+            "timezone": timezone_used,  # ✅ expose the actual tz used
         },
         "window_hours": hours,
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -553,16 +580,18 @@ async def forecast(
             "Hourly data cached per spot per hour (55 min TTL).",
             "Surf estimate is spot-agnostic and may vary due to local bathymetry and sandbars.",
         ],
-        # Provide fully-formed URLs so GPT never assembles incorrectly.
+        # ✅ build URLs using timezone_used so plot matches forecast
         "plot_url": build_plot_url(
-            spot_id=spot_id, hours=hours, timezone=timezone, fmt="png", width=1200, height=500, dpi=140
+            spot_id=spot_id, hours=hours, timezone=timezone_used, fmt="png", width=1200, height=500, dpi=140
         ),
-        "plot_url_small": build_plot_url_small_jpg(spot_id=spot_id, hours=hours, timezone=timezone),
+        "plot_url_small": build_plot_url_small_jpg(spot_id=spot_id, hours=hours, timezone=timezone_used),
     }
 
+    # populate both cache keys so callers using explicit timezone or "auto" both benefit
     _cache_set(_FORECAST_CACHE, cache_key, response, ttl_seconds=FORECAST_TTL_SECONDS)
-    return response
+    _cache_set(_FORECAST_CACHE, provisional_key, response, ttl_seconds=FORECAST_TTL_SECONDS)
 
+    return response
 
 # -----------------------------
 # API: forecast plot (PNG/JPG)
