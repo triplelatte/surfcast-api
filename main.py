@@ -9,6 +9,7 @@ import hashlib
 import asyncio
 from typing import Any, Optional
 from datetime import datetime, date, timedelta
+from urllib.parse import quote
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query
@@ -25,32 +26,33 @@ from astral import Observer
 from astral.sun import sun
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
 
 # -----------------------------
+# Config
+# -----------------------------
+OPEN_METEO_MARINE = "https://marine-api.open-meteo.com/v1/marine"
+SPOTS_CSV_PATH = os.getenv("SPOTS_CSV_PATH", "./surf_registry_us_v4_with_latlon.csv")
+BASE_URL = os.getenv("BASE_URL", "https://surfcast-api.onrender.com").rstrip("/")
+
+FORECAST_TTL_SECONDS = 55 * 60
+PLOT_TTL_SECONDS = 55 * 60
+SUN_TTL_SECONDS = 26 * 60 * 60
+
+
+# -----------------------------
 # Simple in-memory TTL caches
 # -----------------------------
-_CACHE: dict[str, tuple[float, Any]] = {}        # forecast JSON
-_PLOT_CACHE: dict[str, tuple[float, Any]] = {}   # PNG bytes
-_SUN_CACHE: dict[str, tuple[float, Any]] = {}    # (sunrise, sunset)
+_FORECAST_CACHE: dict[str, tuple[float, Any]] = {}  # forecast JSON
+_PLOT_CACHE: dict[str, tuple[float, Any]] = {}  # PNG bytes
+_SUN_CACHE: dict[str, tuple[float, Any]] = {}  # (sunrise, sunset)
 
-def cache_get(key: str) -> Optional[Any]:
-    item = _CACHE.get(key)
-    if not item:
-        return None
-    exp, val = item
-    if time.time() > exp:
-        _CACHE.pop(key, None)
-        return None
-    return val
 
-def cache_set(key: str, val: Any, ttl_seconds: int) -> None:
-    _CACHE[key] = (time.time() + ttl_seconds, val)
-
-def cache_get_from(store: dict[str, tuple[float, Any]], key: str) -> Optional[Any]:
+def _cache_get(store: dict[str, tuple[float, Any]], key: str) -> Optional[Any]:
     item = store.get(key)
     if not item:
         return None
@@ -60,8 +62,10 @@ def cache_get_from(store: dict[str, tuple[float, Any]], key: str) -> Optional[An
         return None
     return val
 
-def cache_set_to(store: dict[str, tuple[float, Any]], key: str, val: Any, ttl_seconds: int) -> None:
+
+def _cache_set(store: dict[str, tuple[float, Any]], key: str, val: Any, ttl_seconds: int) -> None:
     store[key] = (time.time() + ttl_seconds, val)
+
 
 def stable_key(*parts: str) -> str:
     h = hashlib.sha256()
@@ -71,9 +75,9 @@ def stable_key(*parts: str) -> str:
     return h.hexdigest()
 
 
-OPEN_METEO_MARINE = "https://marine-api.open-meteo.com/v1/marine"
-
-
+# -----------------------------
+# Models
+# -----------------------------
 class ForecastResponse(BaseModel):
     spot: dict
     window_hours: int
@@ -81,16 +85,18 @@ class ForecastResponse(BaseModel):
     best_windows: list
     hourly: list
     notes: list[str]
+    plot_url: str
 
 
-app = FastAPI(title="SurfCast API", version="0.7.0")
+# -----------------------------
+# App
+# -----------------------------
+app = FastAPI(title="SurfCast API", version="0.8.0")
 
 
 # -----------------------------
 # Spot registry (CSV, no pandas)
 # -----------------------------
-SPOTS_CSV_PATH = os.getenv("SPOTS_CSV_PATH", "./surf_registry_us_v4_with_latlon.csv")
-
 def _load_spots_csv(path: str) -> list[dict[str, Any]]:
     if not os.path.exists(path):
         raise RuntimeError(f"SPOTS_CSV_PATH not found: {path}")
@@ -99,20 +105,22 @@ def _load_spots_csv(path: str) -> list[dict[str, Any]]:
     with open(path, "r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         required = {"spot_id", "spot_name", "state", "region", "lat", "lon"}
-        if not required.issubset(set(reader.fieldnames or [])):
+        headers = set(reader.fieldnames or [])
+        if not required.issubset(headers):
             raise RuntimeError(
-                f"CSV missing required columns. Need at least: {sorted(required)}; "
-                f"found: {reader.fieldnames}"
+                f"CSV missing required columns. Need at least: {sorted(required)}; found: {sorted(headers)}"
             )
+
         for r in reader:
-            # Keep everything as strings except lat/lon
             try:
                 r["lat"] = float(r["lat"])
                 r["lon"] = float(r["lon"])
             except Exception:
                 continue
             rows.append(r)
+
     return rows
+
 
 spots_rows: list[dict[str, Any]] = _load_spots_csv(SPOTS_CSV_PATH)
 spots_by_id: dict[str, dict[str, Any]] = {r["spot_id"]: r for r in spots_rows}
@@ -165,11 +173,11 @@ async def get_with_backoff(
         if attempt == retries:
             raise HTTPException(
                 status_code=429,
-                detail="Upstream rate limited (429) from Open-Meteo marine endpoint."
+                detail="Upstream rate limited (429) from Open-Meteo marine endpoint.",
             )
 
         await asyncio.sleep(delay)
-        delay = delay * 2.0
+        delay *= 2.0
 
 
 # -----------------------------
@@ -219,24 +227,32 @@ def find_start_index(times: list[str], timezone: str) -> int:
 # -----------------------------
 def daylight_bounds_for_date(d: date, lat: float, lon: float, tz) -> tuple[datetime, datetime]:
     """
-    Returns (sunrise, sunset) for the date at lat/lon in tz.
-    Cached so Astral isn't called repeatedly.
+    Cached sunrise/sunset per (lat,lon,date,tz). Keeps Astral cost low.
     """
     key = stable_key("sun", f"{lat:.4f}", f"{lon:.4f}", str(tz), d.isoformat())
-    cached = cache_get_from(_SUN_CACHE, key)
+    cached = _cache_get(_SUN_CACHE, key)
     if cached:
         return cached
 
     obs = Observer(latitude=lat, longitude=lon)
     s = sun(obs, date=d, tzinfo=tz)
     bounds = (s["sunrise"], s["sunset"])
-    cache_set_to(_SUN_CACHE, key, bounds, ttl_seconds=26 * 60 * 60)
+    _cache_set(_SUN_CACHE, key, bounds, ttl_seconds=SUN_TTL_SECONDS)
     return bounds
 
 
 def is_daylight(dt_local: datetime, lat: float, lon: float, tz) -> bool:
     sunrise, sunset = daylight_bounds_for_date(dt_local.date(), lat, lon, tz)
     return sunrise <= dt_local <= sunset
+
+
+# -----------------------------
+# URL helper (for GPT embedding)
+# -----------------------------
+def build_plot_url(spot_id: str, hours: int, timezone: str) -> str:
+    # Ensure timezone is URL-safe if caller chooses to include it
+    tz_q = quote(timezone, safe="")
+    return f"{BASE_URL}/v1/forecast_plot?spot_id={spot_id}&hours={hours}&timezone={tz_q}"
 
 
 # -----------------------------
@@ -259,15 +275,17 @@ async def forecast(
     hour_bucket = str(int(time.time() // 3600))
     cache_key = stable_key("forecast", spot_id, str(hours), timezone, hour_bucket)
 
-    cached = cache_get(cache_key)
+    cached = _cache_get(_FORECAST_CACHE, cache_key)
     if cached:
         return cached
 
-    hourly_vars = ",".join([
-        "wave_height,wave_period,wave_direction",
-        "swell_wave_height,swell_wave_period,swell_wave_direction",
-        "wind_wave_height",
-    ])
+    hourly_vars = ",".join(
+        [
+            "wave_height,wave_period,wave_direction",
+            "swell_wave_height,swell_wave_period,swell_wave_direction",
+            "wind_wave_height",
+        ]
+    )
 
     async with httpx.AsyncClient(timeout=30) as client:
         marine_resp = await get_with_backoff(
@@ -302,26 +320,25 @@ async def forecast(
     hourly_data: list[dict[str, Any]] = []
     for i in range(n):
         est = surf_estimate_ft(swell[i], period[i], wind_wave[i])
-        hourly_data.append({
-            "time": times[i],
-            "total_wave_m": total_wave[i],
-            "swell_m": swell[i],
-            "period_s": period[i],
-            "wind_wave_m": wind_wave[i],
-            "surf_est_ft": est,
-        })
+        hourly_data.append(
+            {
+                "time": times[i],
+                "total_wave_m": total_wave[i],
+                "swell_m": swell[i],
+                "period_s": period[i],
+                "wind_wave_m": wind_wave[i],
+                "surf_est_ft": est,
+            }
+        )
 
     # ---- Daylight-only ranking for best windows (non-overlapping 3-hour blocks) ----
     best_windows: list[dict[str, Any]] = []
     scores: list[tuple[float, int]] = []
 
-    if ZoneInfo is None:
-        tz = None
-    else:
-        tz = ZoneInfo(timezone)
+    tz = ZoneInfo(timezone) if ZoneInfo is not None else None
 
     for i in range(len(hourly_data) - 2):
-        block = hourly_data[i:i+3]
+        block = hourly_data[i : i + 3]
 
         # Require all 3 hours to be between sunrise and sunset
         if tz is not None:
@@ -348,22 +365,25 @@ async def forecast(
     chosen_ranges: list[tuple[int, int]] = []  # inclusive indices
     for avg, i in scores:
         start_idx = i
-        end_idx = i + 2  # 3 hours block
+        end_idx = i + 2
 
         overlaps = any(not (end_idx < s or start_idx > e) for (s, e) in chosen_ranges)
         if overlaps:
             continue
 
-        block = hourly_data[start_idx:end_idx + 1]
-        best_windows.append({
-            "start": block[0]["time"],
-            "end": block[-1]["time"],
-            "surf_est_ft_range": [
-                round(min(h["surf_est_ft"] for h in block if h["surf_est_ft"] is not None), 1),
-                round(max(h["surf_est_ft"] for h in block if h["surf_est_ft"] is not None), 1),
-            ],
-            "summary": "Top 3-hour surf window (daylight only; non-overlapping).",
-        })
+        block = hourly_data[start_idx : end_idx + 1]
+        block_vals = [h["surf_est_ft"] for h in block if h["surf_est_ft"] is not None]
+        if not block_vals:
+            continue
+
+        best_windows.append(
+            {
+                "start": block[0]["time"],
+                "end": block[-1]["time"],
+                "surf_est_ft_range": [round(min(block_vals), 1), round(max(block_vals), 1)],
+                "summary": "Top 3-hour surf window (daylight only; non-overlapping).",
+            }
+        )
         chosen_ranges.append((start_idx, end_idx))
 
         if len(best_windows) >= 3:
@@ -382,7 +402,6 @@ async def forecast(
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "best_windows": best_windows,
         "hourly": hourly_data,
-        "plot_url": f"https://surfcast-api.onrender.com/v1/forecast_plot?spot_id={spot_id}&hours={hours}&timezone={timezone}",
         "notes": [
             "Marine-only forecast via Open-Meteo marine endpoint.",
             "Forecast window starts at the current local hour (not midnight).",
@@ -390,10 +409,13 @@ async def forecast(
             "Best windows are non-overlapping 3-hour blocks.",
             "Using stored lat/lon from registry.",
             "Hourly data cached per spot per hour (55 min TTL).",
+            "Surf estimate is spot-agnostic and may vary due to local bathymetry and sandbars.",
         ],
+        # Provide a fully-formed plot URL so the GPT never assembles it incorrectly
+        "plot_url": build_plot_url(spot_id=spot_id, hours=hours, timezone=timezone),
     }
 
-    cache_set(cache_key, response, ttl_seconds=55 * 60)
+    _cache_set(_FORECAST_CACHE, cache_key, response, ttl_seconds=FORECAST_TTL_SECONDS)
     return response
 
 
@@ -411,13 +433,18 @@ async def forecast_plot(
 ):
     # Align plot cache to same hour bucket as forecast cache
     hour_bucket = str(int(time.time() // 3600))
-    plot_key = stable_key(
-        "plot", spot_id, str(hours), timezone, hour_bucket, str(width), str(height), str(dpi)
-    )
+    plot_key = stable_key("plot", spot_id, str(hours), timezone, hour_bucket, str(width), str(height), str(dpi))
 
-    cached_png = cache_get_from(_PLOT_CACHE, plot_key)
+    cached_png = _cache_get(_PLOT_CACHE, plot_key)
     if cached_png:
-        return Response(content=cached_png, media_type="image/png")
+        return Response(
+            content=cached_png,
+            media_type="image/png",
+            headers={
+                "Content-Disposition": "inline; filename=surfcast.png",
+                "Cache-Control": f"public, max-age={PLOT_TTL_SECONDS}",
+            },
+        )
 
     # Reuse forecast logic (will hit forecast cache if warm)
     fc = await forecast(spot_id=spot_id, hours=hours, timezone=timezone)
@@ -429,7 +456,7 @@ async def forecast_plot(
     lat = float(fc["spot"]["lat"])
     lon = float(fc["spot"]["lon"])
 
-    # Parse times + values
+    # Parse times + values (total_wave_m)
     x: list[datetime] = []
     y: list[float] = []
     for h in fc["hourly"]:
@@ -438,6 +465,7 @@ async def forecast_plot(
         except ValueError:
             continue
         x.append(dt)
+
         val = h.get("total_wave_m")
         try:
             y.append(float(val) if val is not None else float("nan"))
@@ -447,7 +475,7 @@ async def forecast_plot(
     if not x:
         raise HTTPException(502, "No hourly data to plot")
 
-    # Daylight shading spans per day (handles multi-day forecasts)
+    # Daylight shading spans per day
     dates = sorted({dt.date() for dt in x})
     day_bounds = {d: daylight_bounds_for_date(d, lat, lon, tz) for d in dates}
 
@@ -485,7 +513,7 @@ async def forecast_plot(
         if sunset < seg_end:
             ax.axvspan(max(sunset, seg_start), seg_end, alpha=0.15)
 
-    # Highlight best windows in green
+    # Highlight best windows
     for s, e in best_spans:
         ax.axvspan(s, e, alpha=0.20)
 
@@ -504,12 +532,12 @@ async def forecast_plot(
     plt.close(fig)
     png = buf.getvalue()
 
-    cache_set_to(_PLOT_CACHE, plot_key, png, ttl_seconds=55 * 60)
+    _cache_set(_PLOT_CACHE, plot_key, png, ttl_seconds=PLOT_TTL_SECONDS)
     return Response(
         content=png,
         media_type="image/png",
         headers={
             "Content-Disposition": "inline; filename=surfcast.png",
-            "Cache-Control": "public, max-age=3300",
-        }
+            "Cache-Control": f"public, max-age={PLOT_TTL_SECONDS}",
+        },
     )
