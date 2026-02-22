@@ -321,28 +321,35 @@ def render_forecast_image(
     if not x:
         raise HTTPException(502, "No hourly data to plot")
 
-    # Daylight shading per day
+    # Determine plot bounds
+    tmin = x[0]
+    tmax = x[-1] + timedelta(hours=1)
+
+    # Precompute daylight bounds per day (cached by your daylight_bounds_for_date)
     dates = sorted({dt.date() for dt in x})
     day_bounds = {d: daylight_bounds_for_date(d, lat, lon, tz) for d in dates}
 
-    # Best window spans
+    # Best window spans (green)
     best_spans: list[tuple[datetime, datetime]] = []
     for bw in best_windows:
         try:
             s = datetime.fromisoformat(bw["start"]).replace(tzinfo=tz)
             e = datetime.fromisoformat(bw["end"]).replace(tzinfo=tz) + timedelta(hours=1)
-            best_spans.append((s, e))
+            # clamp to plot range
+            s = max(s, tmin)
+            e = min(e, tmax)
+            if s < e:
+                best_spans.append((s, e))
         except Exception:
             continue
 
     fig = plt.figure(figsize=(width / dpi, height / dpi), dpi=dpi)
     ax = fig.add_subplot(111)
 
-    ax.plot(x, y)
-
-    # Shade dusk->dawn (outside sunrise->sunset)
-    tmin = x[0]
-    tmax = x[-1] + timedelta(hours=1)
+    # 1) Shade dusk->dawn in grey (outside sunrise->sunset), per day segment
+    # Use explicit facecolor so it is never “random”
+    night_color = "0.85"  # light grey
+    night_alpha = 0.6
 
     for d in dates:
         sunrise, sunset = day_bounds[d]
@@ -354,14 +361,27 @@ def render_forecast_image(
         if seg_start >= seg_end:
             continue
 
+        # pre-dawn segment
         if seg_start < sunrise:
-            ax.axvspan(seg_start, min(sunrise, seg_end), alpha=0.15)
+            ax.axvspan(
+                seg_start, min(sunrise, seg_end),
+                facecolor=night_color, alpha=night_alpha, zorder=0
+            )
+        # post-dusk segment
         if sunset < seg_end:
-            ax.axvspan(max(sunset, seg_start), seg_end, alpha=0.15)
+            ax.axvspan(
+                max(sunset, seg_start), seg_end,
+                facecolor=night_color, alpha=night_alpha, zorder=0
+            )
 
-    # Highlight best windows
+    # 2) Highlight best windows in green (on top of night shading)
+    best_color = "green"
+    best_alpha = 0.22
     for s, e in best_spans:
-        ax.axvspan(s, e, alpha=0.20)
+        ax.axvspan(s, e, facecolor=best_color, alpha=best_alpha, zorder=1)
+
+    # 3) Plot series last so it sits on top
+    ax.plot(x, y, zorder=2)
 
     ax.set_title(f"{spot_name} — Total Wave (m)")
     ax.set_ylabel("total_wave_m")
@@ -374,13 +394,8 @@ def render_forecast_image(
 
     buf = io.BytesIO()
     if fmt == "jpg":
-        # Use Pillow backend kwargs safely
-        fig.savefig(
-            buf,
-            format="jpeg",
-            dpi=dpi,
-            pil_kwargs={"quality": 85, "optimize": True},
-        )
+        # Safer JPEG save across environments
+        fig.savefig(buf, format="jpeg", dpi=dpi, pil_kwargs={"quality": 85, "optimize": True})
     else:
         fig.savefig(buf, format="png", dpi=dpi)
 
