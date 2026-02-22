@@ -1,6 +1,8 @@
 fastapi
 uvicorn
 httpx
-pandas
+cachetools
 pydantic
 astral
+matplotlib
+timezonefinder
