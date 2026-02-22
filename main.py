@@ -374,8 +374,13 @@ def render_forecast_image(
 
     buf = io.BytesIO()
     if fmt == "jpg":
-        # JPEG is much smaller and more likely to embed reliably
-        fig.savefig(buf, format="jpg", dpi=dpi, quality=85)
+        # Use Pillow backend kwargs safely
+        fig.savefig(
+            buf,
+            format="jpeg",
+            dpi=dpi,
+            pil_kwargs={"quality": 85, "optimize": True},
+        )
     else:
         fig.savefig(buf, format="png", dpi=dpi)
 
