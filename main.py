@@ -318,7 +318,7 @@ def render_forecast_image(
             continue
         x.append(dt)
 
-        val = h.get("total_wave_m")
+        val = h.get("surf_est_ft")
         try:
             y.append(float(val) if val is not None else float("nan"))
         except Exception:
@@ -383,8 +383,8 @@ def render_forecast_image(
     # Plot series last
     ax.plot(x, y, zorder=2)
 
-    ax.set_title(f"{spot_name} — Total Wave (m)")
-    ax.set_ylabel("total_wave_m")
+    ax.set_title(f"{spot_name} — Total Wave (ft)")
+    ax.set_ylabel("surf_est_ft")
     ax.set_xlabel("Local time")
 
     # ✅ Force matplotlib to format ticks in the same tz
