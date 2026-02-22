@@ -7,7 +7,7 @@ import time
 import math
 import hashlib
 import asyncio
-from typing import Any, Optional
+from typing import Any, Optional, Literal
 from datetime import datetime, date, timedelta
 from urllib.parse import quote
 
@@ -48,7 +48,7 @@ SUN_TTL_SECONDS = 26 * 60 * 60
 # Simple in-memory TTL caches
 # -----------------------------
 _FORECAST_CACHE: dict[str, tuple[float, Any]] = {}  # forecast JSON
-_PLOT_CACHE: dict[str, tuple[float, Any]] = {}  # PNG bytes
+_PLOT_CACHE: dict[str, tuple[float, Any]] = {}  # image bytes
 _SUN_CACHE: dict[str, tuple[float, Any]] = {}  # (sunrise, sunset)
 
 
@@ -86,12 +86,13 @@ class ForecastResponse(BaseModel):
     hourly: list
     notes: list[str]
     plot_url: str
+    plot_url_small: str
 
 
 # -----------------------------
 # App
 # -----------------------------
-app = FastAPI(title="SurfCast API", version="0.8.0")
+app = FastAPI(title="SurfCast API", version="0.9.0")
 
 
 # -----------------------------
@@ -227,7 +228,7 @@ def find_start_index(times: list[str], timezone: str) -> int:
 # -----------------------------
 def daylight_bounds_for_date(d: date, lat: float, lon: float, tz) -> tuple[datetime, datetime]:
     """
-    Cached sunrise/sunset per (lat,lon,date,tz). Keeps Astral cost low.
+    Cached sunrise/sunset per (lat,lon,date,tz).
     """
     key = stable_key("sun", f"{lat:.4f}", f"{lon:.4f}", str(tz), d.isoformat())
     cached = _cache_get(_SUN_CACHE, key)
@@ -247,12 +248,139 @@ def is_daylight(dt_local: datetime, lat: float, lon: float, tz) -> bool:
 
 
 # -----------------------------
-# URL helper (for GPT embedding)
+# URL helpers (for GPT embedding)
 # -----------------------------
-def build_plot_url(spot_id: str, hours: int, timezone: str) -> str:
-    # Ensure timezone is URL-safe if caller chooses to include it
-    tz_q = quote(timezone, safe="")
-    return f"{BASE_URL}/v1/forecast_plot?spot_id={spot_id}&hours={hours}&timezone={tz_q}"
+def _tz_q(timezone: str) -> str:
+    return quote(timezone, safe="")
+
+
+def build_plot_url(
+    spot_id: str,
+    hours: int,
+    timezone: str,
+    *,
+    fmt: str = "png",
+    width: int = 1200,
+    height: int = 500,
+    dpi: int = 140,
+) -> str:
+    # include timezone; safely encoded
+    return (
+        f"{BASE_URL}/v1/forecast_plot?"
+        f"spot_id={spot_id}&hours={hours}&timezone={_tz_q(timezone)}"
+        f"&format={fmt}&width={width}&height={height}&dpi={dpi}"
+    )
+
+
+def build_plot_url_small_jpg(spot_id: str, hours: int, timezone: str) -> str:
+    # Smaller + JPEG: more likely to render in GPT UIs
+    return build_plot_url(
+        spot_id=spot_id,
+        hours=hours,
+        timezone=timezone,
+        fmt="jpg",
+        width=900,
+        height=360,
+        dpi=110,
+    )
+
+
+# -----------------------------
+# Matplotlib renderer
+# -----------------------------
+def render_forecast_image(
+    *,
+    spot_name: str,
+    tz,
+    hourly: list[dict[str, Any]],
+    best_windows: list[dict[str, Any]],
+    lat: float,
+    lon: float,
+    width: int,
+    height: int,
+    dpi: int,
+    fmt: Literal["png", "jpg"],
+) -> bytes:
+    # Parse series
+    x: list[datetime] = []
+    y: list[float] = []
+
+    for h in hourly:
+        try:
+            dt = datetime.fromisoformat(h["time"]).replace(tzinfo=tz)
+        except Exception:
+            continue
+        x.append(dt)
+
+        val = h.get("total_wave_m")
+        try:
+            y.append(float(val) if val is not None else float("nan"))
+        except Exception:
+            y.append(float("nan"))
+
+    if not x:
+        raise HTTPException(502, "No hourly data to plot")
+
+    # Daylight shading per day
+    dates = sorted({dt.date() for dt in x})
+    day_bounds = {d: daylight_bounds_for_date(d, lat, lon, tz) for d in dates}
+
+    # Best window spans
+    best_spans: list[tuple[datetime, datetime]] = []
+    for bw in best_windows:
+        try:
+            s = datetime.fromisoformat(bw["start"]).replace(tzinfo=tz)
+            e = datetime.fromisoformat(bw["end"]).replace(tzinfo=tz) + timedelta(hours=1)
+            best_spans.append((s, e))
+        except Exception:
+            continue
+
+    fig = plt.figure(figsize=(width / dpi, height / dpi), dpi=dpi)
+    ax = fig.add_subplot(111)
+
+    ax.plot(x, y)
+
+    # Shade dusk->dawn (outside sunrise->sunset)
+    tmin = x[0]
+    tmax = x[-1] + timedelta(hours=1)
+
+    for d in dates:
+        sunrise, sunset = day_bounds[d]
+        day_start = datetime(d.year, d.month, d.day, 0, 0, tzinfo=tz)
+        day_end = day_start + timedelta(days=1)
+
+        seg_start = max(tmin, day_start)
+        seg_end = min(tmax, day_end)
+        if seg_start >= seg_end:
+            continue
+
+        if seg_start < sunrise:
+            ax.axvspan(seg_start, min(sunrise, seg_end), alpha=0.15)
+        if sunset < seg_end:
+            ax.axvspan(max(sunset, seg_start), seg_end, alpha=0.15)
+
+    # Highlight best windows
+    for s, e in best_spans:
+        ax.axvspan(s, e, alpha=0.20)
+
+    ax.set_title(f"{spot_name} — Total Wave (m)")
+    ax.set_ylabel("total_wave_m")
+    ax.set_xlabel("Local time")
+
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%-I%p"))
+    ax.xaxis.set_major_locator(mdates.HourLocator(interval=3))
+    fig.autofmt_xdate()
+    fig.tight_layout()
+
+    buf = io.BytesIO()
+    if fmt == "jpg":
+        # JPEG is much smaller and more likely to embed reliably
+        fig.savefig(buf, format="jpg", dpi=dpi, quality=85)
+    else:
+        fig.savefig(buf, format="png", dpi=dpi)
+
+    plt.close(fig)
+    return buf.getvalue()
 
 
 # -----------------------------
@@ -271,10 +399,8 @@ async def forecast(
     lat = float(spot["lat"])
     lon = float(spot["lon"])
 
-    # Cache per hour bucket (keeps upstream calls low)
     hour_bucket = str(int(time.time() // 3600))
     cache_key = stable_key("forecast", spot_id, str(hours), timezone, hour_bucket)
-
     cached = _cache_get(_FORECAST_CACHE, cache_key)
     if cached:
         return cached
@@ -334,13 +460,11 @@ async def forecast(
     # ---- Daylight-only ranking for best windows (non-overlapping 3-hour blocks) ----
     best_windows: list[dict[str, Any]] = []
     scores: list[tuple[float, int]] = []
-
     tz = ZoneInfo(timezone) if ZoneInfo is not None else None
 
     for i in range(len(hourly_data) - 2):
         block = hourly_data[i : i + 3]
 
-        # Require all 3 hours to be between sunrise and sunset
         if tz is not None:
             ok = True
             for h in block:
@@ -362,11 +486,10 @@ async def forecast(
 
     scores.sort(reverse=True)
 
-    chosen_ranges: list[tuple[int, int]] = []  # inclusive indices
+    chosen_ranges: list[tuple[int, int]] = []
     for avg, i in scores:
         start_idx = i
         end_idx = i + 2
-
         overlaps = any(not (end_idx < s or start_idx > e) for (s, e) in chosen_ranges)
         if overlaps:
             continue
@@ -385,7 +508,6 @@ async def forecast(
             }
         )
         chosen_ranges.append((start_idx, end_idx))
-
         if len(best_windows) >= 3:
             break
 
@@ -411,8 +533,11 @@ async def forecast(
             "Hourly data cached per spot per hour (55 min TTL).",
             "Surf estimate is spot-agnostic and may vary due to local bathymetry and sandbars.",
         ],
-        # Provide a fully-formed plot URL so the GPT never assembles it incorrectly
-        "plot_url": build_plot_url(spot_id=spot_id, hours=hours, timezone=timezone),
+        # Provide fully-formed URLs so GPT never assembles incorrectly.
+        "plot_url": build_plot_url(
+            spot_id=spot_id, hours=hours, timezone=timezone, fmt="png", width=1200, height=500, dpi=140
+        ),
+        "plot_url_small": build_plot_url_small_jpg(spot_id=spot_id, hours=hours, timezone=timezone),
     }
 
     _cache_set(_FORECAST_CACHE, cache_key, response, ttl_seconds=FORECAST_TTL_SECONDS)
@@ -420,124 +545,76 @@ async def forecast(
 
 
 # -----------------------------
-# API: forecast plot (PNG)
+# API: forecast plot (PNG/JPG)
 # -----------------------------
 @app.get("/v1/forecast_plot")
 async def forecast_plot(
     spot_id: str,
     hours: int = Query(72, ge=6, le=168),
     timezone: str = "America/Los_Angeles",
+    format: str = Query("jpg", pattern="^(png|jpg)$"),
+    # Smaller defaults are more likely to render in GPT UIs
     width: int = Query(900, ge=600, le=2400),
     height: int = Query(360, ge=300, le=1200),
     dpi: int = Query(110, ge=90, le=200),
 ):
-    # Align plot cache to same hour bucket as forecast cache
     hour_bucket = str(int(time.time() // 3600))
-    plot_key = stable_key("plot", spot_id, str(hours), timezone, hour_bucket, str(width), str(height), str(dpi))
+    plot_key = stable_key(
+        "plot",
+        spot_id,
+        str(hours),
+        timezone,
+        hour_bucket,
+        format,
+        str(width),
+        str(height),
+        str(dpi),
+    )
 
-    cached_png = _cache_get(_PLOT_CACHE, plot_key)
-    if cached_png:
+    cached_img = _cache_get(_PLOT_CACHE, plot_key)
+    if cached_img:
+        mime = "image/png" if format == "png" else "image/jpeg"
         return Response(
-            content=cached_png,
-            media_type="image/png",
+            content=cached_img,
+            media_type=mime,
             headers={
-                "Content-Disposition": "inline; filename=surfcast.png",
+                "Content-Disposition": f"inline; filename=surfcast.{format}",
                 "Cache-Control": f"public, max-age={PLOT_TTL_SECONDS}",
             },
         )
 
-    # Reuse forecast logic (will hit forecast cache if warm)
     fc = await forecast(spot_id=spot_id, hours=hours, timezone=timezone)
 
     if ZoneInfo is None:
         raise HTTPException(500, "zoneinfo not available on this runtime")
-
     tz = ZoneInfo(timezone)
+
     lat = float(fc["spot"]["lat"])
     lon = float(fc["spot"]["lon"])
-
-    # Parse times + values (total_wave_m)
-    x: list[datetime] = []
-    y: list[float] = []
-    for h in fc["hourly"]:
-        try:
-            dt = datetime.fromisoformat(h["time"]).replace(tzinfo=tz)
-        except ValueError:
-            continue
-        x.append(dt)
-
-        val = h.get("total_wave_m")
-        try:
-            y.append(float(val) if val is not None else float("nan"))
-        except Exception:
-            y.append(float("nan"))
-
-    if not x:
-        raise HTTPException(502, "No hourly data to plot")
-
-    # Daylight shading spans per day
-    dates = sorted({dt.date() for dt in x})
-    day_bounds = {d: daylight_bounds_for_date(d, lat, lon, tz) for d in dates}
-
-    # Best windows (green spans)
-    best_spans: list[tuple[datetime, datetime]] = []
-    for bw in fc.get("best_windows", []):
-        try:
-            s = datetime.fromisoformat(bw["start"]).replace(tzinfo=tz)
-            e = datetime.fromisoformat(bw["end"]).replace(tzinfo=tz) + timedelta(hours=1)
-            best_spans.append((s, e))
-        except Exception:
-            continue
-
-    fig = plt.figure(figsize=(width / dpi, height / dpi), dpi=dpi)
-    ax = fig.add_subplot(111)
-
-    ax.plot(x, y)
-
-    # Shade dusk->dawn (outside sunrise->sunset)
-    tmin = x[0]
-    tmax = x[-1] + timedelta(hours=1)
-
-    for d in dates:
-        sunrise, sunset = day_bounds[d]
-        day_start = datetime(d.year, d.month, d.day, 0, 0, tzinfo=tz)
-        day_end = day_start + timedelta(days=1)
-
-        seg_start = max(tmin, day_start)
-        seg_end = min(tmax, day_end)
-        if seg_start >= seg_end:
-            continue
-
-        if seg_start < sunrise:
-            ax.axvspan(seg_start, min(sunrise, seg_end), alpha=0.15)
-        if sunset < seg_end:
-            ax.axvspan(max(sunset, seg_start), seg_end, alpha=0.15)
-
-    # Highlight best windows
-    for s, e in best_spans:
-        ax.axvspan(s, e, alpha=0.20)
-
     spot_name = fc["spot"].get("name", spot_id)
-    ax.set_title(f"{spot_name} — Total Wave (m)")
-    ax.set_ylabel("total_wave_m")
-    ax.set_xlabel("Local time")
 
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%-I%p"))
-    ax.xaxis.set_major_locator(mdates.HourLocator(interval=3))
-    fig.autofmt_xdate()
-    fig.tight_layout()
+    fmt = "png" if format == "png" else "jpg"
+    img = render_forecast_image(
+        spot_name=spot_name,
+        tz=tz,
+        hourly=fc["hourly"],
+        best_windows=fc["best_windows"],
+        lat=lat,
+        lon=lon,
+        width=width,
+        height=height,
+        dpi=dpi,
+        fmt=fmt,  # type: ignore[arg-type]
+    )
 
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png")
-    plt.close(fig)
-    png = buf.getvalue()
+    _cache_set(_PLOT_CACHE, plot_key, img, ttl_seconds=PLOT_TTL_SECONDS)
 
-    _cache_set(_PLOT_CACHE, plot_key, png, ttl_seconds=PLOT_TTL_SECONDS)
+    mime = "image/png" if format == "png" else "image/jpeg"
     return Response(
-        content=png,
-        media_type="image/png",
+        content=img,
+        media_type=mime,
         headers={
-            "Content-Disposition": "inline; filename=surfcast.png",
+            "Content-Disposition": f"inline; filename=surfcast.{format}",
             "Cache-Control": f"public, max-age={PLOT_TTL_SECONDS}",
         },
     )
