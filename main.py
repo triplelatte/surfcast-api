@@ -427,9 +427,9 @@ async def forecast_plot(
     spot_id: str,
     hours: int = Query(72, ge=6, le=168),
     timezone: str = "America/Los_Angeles",
-    width: int = Query(1200, ge=600, le=2400),
-    height: int = Query(500, ge=300, le=1200),
-    dpi: int = Query(140, ge=90, le=200),
+    width: int = Query(900, ge=600, le=2400),
+    height: int = Query(360, ge=300, le=1200),
+    dpi: int = Query(110, ge=90, le=200),
 ):
     # Align plot cache to same hour bucket as forecast cache
     hour_bucket = str(int(time.time() // 3600))
