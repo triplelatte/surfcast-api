@@ -382,6 +382,7 @@ async def forecast(
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "best_windows": best_windows,
         "hourly": hourly_data,
+        "plot_url": f"https://surfcast-api.onrender.com/v1/forecast_plot?spot_id={spot_id}&hours={hours}&timezone={timezone}",
         "notes": [
             "Marine-only forecast via Open-Meteo marine endpoint.",
             "Forecast window starts at the current local hour (not midnight).",
@@ -504,4 +505,10 @@ async def forecast_plot(
     png = buf.getvalue()
 
     cache_set_to(_PLOT_CACHE, plot_key, png, ttl_seconds=55 * 60)
-    return Response(content=png, media_type="image/png")
+    return Response(
+        content=png,
+        media_type="image/png",
+        headers={
+            "Content-Disposition": "inline; filename=surfcast.png",
+            "Cache-Control": "public, max-age=3300",
+        },
