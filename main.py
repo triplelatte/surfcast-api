@@ -511,4 +511,5 @@ async def forecast_plot(
         headers={
             "Content-Disposition": "inline; filename=surfcast.png",
             "Cache-Control": "public, max-age=3300",
-        },
+        }
+    )
